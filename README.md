@@ -1,34 +1,14 @@
-# autumn
+# Friday
 
-An Electron application with React and TypeScript
+A desktop coding workspace built with Electron, React, Monaco Editor, and xterm.js.
 
-## Recommended IDE Setup
+## Run locally
 
-- [VSCode](https://code.visualstudio.com/) + [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint) + [Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode)
-
-## Project Setup
-
-### Install
-
-```bash
-$ npm install
+```sh
+npm install
+npm run dev
 ```
 
-### Development
+Open a folder to browse and edit files. Use `Ctrl+S` to save, `Ctrl+O` to open another folder, and `Ctrl+Shift+P` for the command palette. The integrated terminal runs PowerShell on Windows and the configured shell on macOS and Linux.
 
-```bash
-$ npm run dev
-```
-
-### Build
-
-```bash
-# For windows
-$ npm run build:win
-
-# For macOS
-$ npm run build:mac
-
-# For Linux
-$ npm run build:linux
-```
+The agent panel accepts an OpenAI-compatible chat completions endpoint, model name, and API key. Credentials stay in memory for the current app session.
