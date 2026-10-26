@@ -1,15 +1,20 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import * as pty from 'node-pty'
+import { FridayAgent } from './agent'
 
 let mainWindow: BrowserWindow | null = null
+const fridayAgent = new FridayAgent(() => mainWindow)
 let terminal: pty.IPty | null = null
+let activeTerminalId = ''
+const terminalSessions = new Map<string, { process: pty.IPty; kind: 'local' | 'ssh'; cwd: string }>()
 let currentRoot = ''
-let agentConfig: { endpoint: string; model: string; apiKey: string } | null = null
+let workspaceRoots: string[] = []
 let terminalKind: 'local' | 'ssh' | null = null
 let pendingBrowserOpen = false
 let browserOpenTimer: NodeJS.Timeout | null = null
@@ -23,13 +28,13 @@ function isWithinRoot(root: string, target: string) {
 
 function ensureWithinRoot(target: string) {
   const resolved = path.resolve(target)
-  if (!currentRoot || !isWithinRoot(currentRoot, resolved)) throw new Error('Path is outside the open project.')
+  if (!workspaceRoots.some((root) => isWithinRoot(root, resolved))) throw new Error('Path is outside the open workspace.')
   return resolved
 }
 
 async function existingWithinRoot(target: string) {
   const canonical = await realpath(ensureWithinRoot(target))
-  if (!isWithinRoot(currentRoot, canonical)) throw new Error('Path resolves outside the open project.')
+  if (!workspaceRoots.some((root) => isWithinRoot(root, canonical))) throw new Error('Path resolves outside the open workspace.')
   return canonical
 }
 
@@ -52,11 +57,13 @@ async function addRecent(projectPath: string) {
   const recent = [projectPath, ...previous.filter((item) => item !== projectPath)].slice(0, 8)
   await writeFile(recentFile(), JSON.stringify(recent, null, 2), 'utf8')
   currentRoot = projectPath
+  workspaceRoots = [projectPath]
+  fridayAgent.setRoot(projectPath)
   return recent
 }
 
-function sendTerminal(text: string) {
-  mainWindow?.webContents.send('terminal:data', text)
+function sendTerminal(text: string, id = activeTerminalId) {
+  mainWindow?.webContents.send('terminal:data', id, text)
 }
 
 type TerminalProfile = { id: string; label: string; command: string; args: string[] }
@@ -84,27 +91,39 @@ function detectedTerminalProfiles(): TerminalProfile[] {
   return profiles
 }
 
-function startPty(command: string, args: string[], cwd: string) {
-  terminal?.kill()
-  const session = pty.spawn(command, args, { cwd, name: 'xterm-256color', cols: 100, rows: 30, env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string> })
+function startPty(command: string, args: string[], cwd: string, cols = 100, rows = 30, id: string = randomUUID(), kind: 'local' | 'ssh' = 'local') {
+  terminalSessions.get(id)?.process.kill()
+  const session = pty.spawn(command, args, { cwd, name: 'xterm-256color', cols: Math.max(20, cols), rows: Math.max(5, rows), env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string> })
   terminal = session
+  activeTerminalId = id
+  terminalSessions.set(id, { process: session, kind, cwd })
   session.onData((data) => {
-    sendTerminal(data)
+    sendTerminal(data, id)
     const plainOutput = data.replace(/\x1b\[[0-9;]*m/g, '')
     const localUrl = pendingBrowserOpen ? plainOutput.match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?[^\s]*/)?.[0].replace(/[),.;]+$/, '') : undefined
     if (localUrl) { pendingBrowserOpen = false; if (browserOpenTimer) clearTimeout(browserOpenTimer); browserOpenTimer = null; void shell.openExternal(localUrl) }
   })
   session.onExit(({ exitCode }) => {
-    sendTerminal(`\r\n[process exited${exitCode === undefined ? '' : ` with code ${exitCode}`} ]\r\n`)
-    if (terminal === session) { terminal = null; terminalKind = null }
+    const isCurrentSession = terminalSessions.get(id)?.process === session
+    if (isCurrentSession) {
+      sendTerminal(`\r\n[process exited${exitCode === undefined ? '' : ` with code ${exitCode}`} ]\r\n`, id)
+      terminalSessions.delete(id)
+    }
+    if (isCurrentSession && activeTerminalId === id) {
+      const next = [...terminalSessions.entries()].at(-1)
+      activeTerminalId = next?.[0] || ''
+      terminal = next?.[1].process || null
+      terminalKind = next?.[1].kind || null
+    }
   })
+  terminalKind = kind
+  return id
 }
 
-function startLocalTerminal(profileId?: string) {
+function startLocalTerminal(profileId?: string, cols = 100, rows = 30, cwd = currentRoot, id: string = randomUUID()) {
   const profile = detectedTerminalProfiles().find((item) => item.id === profileId) || detectedTerminalProfiles()[0]
   if (!profile) throw new Error('No supported terminal shell was found.')
-  startPty(profile.command, profile.args, currentRoot)
-  terminalKind = 'local'
+  return startPty(profile.command, profile.args, ensureWithinRoot(cwd), cols, rows, id, 'local')
 }
 
 function quoteForShell(value: string) {
@@ -239,6 +258,25 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  ipcMain.handle('agent:status', (event) => { if (event.sender !== mainWindow?.webContents) throw new Error('Agent status is only available to Friday.'); return fridayAgent.status() })
+  ipcMain.handle('agent:test-connection', (event) => { if (event.sender !== mainWindow?.webContents) throw new Error('Connection checks are only accepted from Friday.'); return fridayAgent.testConnection() })
+  ipcMain.handle('agent:send', async (event, request: unknown, options: unknown) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Agent requests are only accepted from Friday.')
+    if (typeof request !== 'string' || request.length > 12000) throw new Error('Agent request must be text under 12,000 characters.')
+    const raw = options && typeof options === 'object' ? options as Record<string, unknown> : {}
+    const buffers = Array.isArray(raw.buffers) ? raw.buffers : []
+    if (buffers.length > 100 || buffers.some((item) => !item || typeof item !== 'object' || typeof (item as { path?: unknown }).path !== 'string' || typeof (item as { content?: unknown }).content !== 'string' || (item as { content: string }).content.length > 350_000 || typeof (item as { dirty?: unknown }).dirty !== 'boolean')) throw new Error('Invalid editor buffer context.')
+    const history = Array.isArray(raw.history) ? raw.history : []
+    if (history.length > 12 || history.some((item) => !item || typeof item !== 'object' || !['user', 'assistant'].includes(String((item as { role?: unknown }).role)) || typeof (item as { content?: unknown }).content !== 'string' || (item as { content: string }).content.length > 18000)) throw new Error('Invalid conversation history.')
+    const opts = { buffers: buffers as NonNullable<Parameters<FridayAgent['send']>[1]>['buffers'], history: history as NonNullable<Parameters<FridayAgent['send']>[1]>['history'] }
+    return fridayAgent.send(request, opts)
+  })
+  ipcMain.handle('agent:approve', (event, id: unknown, approved: unknown) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('Approval responses are only accepted from Friday.')
+    if (typeof id !== 'string' || typeof approved !== 'boolean') return false
+    return fridayAgent.decide(id, approved)
+  })
+  ipcMain.handle('agent:cancel', (event) => { if (event.sender !== mainWindow?.webContents) throw new Error('Cancellation requests are only accepted from Friday.'); return fridayAgent.cancel() })
   ipcMain.handle('run:file', async (_event, target: string) => runFile(target))
   ipcMain.handle('git:status', () => gitCommand(['status', '--short', '--branch']))
   ipcMain.handle('git:stage-all', () => gitCommand(['add', '-A']))
@@ -274,10 +312,31 @@ app.whenReady().then(() => {
     const recent = await addRecent(currentRoot)
     return { root: currentRoot, recent, tree: await treeFor(currentRoot) }
   })
-  ipcMain.handle('project:refresh', async () => currentRoot ? treeFor(currentRoot) : [])
+  ipcMain.handle('project:refresh', async (_event, folder?: string) => folder ? treeFor(folder, await existingWithinRoot(folder)) : currentRoot ? treeFor(currentRoot) : [])
+  ipcMain.handle('workspace:open-folder', async (_event, parent?: string | null) => {
+    const safeParent = parent ? await existingWithinRoot(parent) : undefined
+    const options = { title: 'Add Folder to Workspace', ...(safeParent ? { defaultPath: safeParent } : {}), properties: ['openDirectory'] as Array<'openDirectory'> }
+    const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options)
+    if (result.canceled || !result.filePaths[0]) return null
+    const folder = await realpath(result.filePaths[0])
+    if (!(await stat(folder)).isDirectory()) throw new Error('Choose a folder.')
+    return { name: path.basename(folder), path: folder, directory: true }
+  })
+  ipcMain.handle('workspace:set-roots', async (_event, roots: string[]) => {
+    if (!Array.isArray(roots)) throw new Error('Workspace folders must be a list.')
+    const canonical = [...new Set(await Promise.all(roots.map(async (root) => {
+      const folder = await realpath(path.resolve(root))
+      if (!(await stat(folder)).isDirectory()) throw new Error('A workspace folder is no longer available.')
+      return folder
+    })))]
+    workspaceRoots = canonical
+    currentRoot = canonical[0] || ''
+    fridayAgent.setRoot(currentRoot)
+    return true
+  })
   ipcMain.handle('project:list-directory', async (_event, folder: string) => treeFor(currentRoot, await existingWithinRoot(folder)))
   ipcMain.handle('project:list-files', async () => {
-    if (!currentRoot) return []
+    if (!workspaceRoots.length) return []
     const files: Array<{ name: string; path: string }> = []
     const walk = async (folder: string): Promise<void> => {
       if (files.length >= 3000) return
@@ -289,11 +348,12 @@ app.whenReady().then(() => {
         if (files.length >= 3000) break
       }
     }
-    await walk(currentRoot)
+    const roots = workspaceRoots.filter((root) => !workspaceRoots.some((other) => other !== root && isWithinRoot(other, root)))
+    for (const root of roots) await walk(root)
     return files
   })
   ipcMain.handle('project:search', async (_event, query: string) => {
-    if (!currentRoot || !query.trim()) return []
+    if (!workspaceRoots.length || !query.trim()) return []
     const needle = query.toLowerCase()
     const matches: Array<{ path: string; name: string; line?: number; preview?: string }> = []
     const walk = async (folder: string): Promise<void> => {
@@ -314,7 +374,8 @@ app.whenReady().then(() => {
         } catch { /* non-text or transient file */ }
       }
     }
-    await walk(currentRoot)
+    const roots = workspaceRoots.filter((root) => !workspaceRoots.some((other) => other !== root && isWithinRoot(other, root)))
+    for (const root of roots) await walk(root)
     return matches
   })
   ipcMain.handle('file:read', async (_event, target: string) => readFile(await existingWithinRoot(target), 'utf8'))
@@ -333,7 +394,7 @@ app.whenReady().then(() => {
   })
   ipcMain.handle('file:delete', async (_event, target: string) => {
     const resolved = await existingWithinRoot(target)
-    if (resolved === currentRoot) throw new Error('Cannot delete the project root.')
+    if (workspaceRoots.some((root) => isWithinRoot(resolved, root))) throw new Error('Remove this folder from the workspace instead of deleting a workspace folder.')
     const { rm } = await import('node:fs/promises')
     await rm(resolved, { recursive: true })
     return true
@@ -353,49 +414,42 @@ app.whenReady().then(() => {
   })
   ipcMain.handle('terminal:start', async () => {
     if (!currentRoot) throw new Error('Open a project first.')
-    if (terminal && terminalKind === 'local') return true
-    sendTerminal('\x1b[2J\x1b[H')
-    startLocalTerminal()
-    return true
+    if (terminal && terminalKind === 'local') return activeTerminalId
+    return startLocalTerminal()
   })
   ipcMain.handle('terminal:profiles', async () => detectedTerminalProfiles().map(({ id, label }) => ({ id, label })))
-  ipcMain.handle('terminal:start-profile', async (_event, id: string) => {
-    if (!currentRoot) throw new Error('Open a project first.')
-    startLocalTerminal(id)
+  ipcMain.handle('terminal:activate', async (_event, id: string) => {
+    const session = terminalSessions.get(id)
+    if (!session) return false
+    activeTerminalId = id
+    terminal = session.process
+    terminalKind = session.kind
     return true
   })
-  ipcMain.handle('terminal:input', async (_event, input: string) => { terminal?.write(input); return true })
-  ipcMain.handle('terminal:resize', async (_event, cols: number, rows: number) => { if (terminal && cols > 0 && rows > 0) terminal.resize(cols, rows); return true })
+  ipcMain.handle('terminal:start-profile', async (_event, profileId: string, cols: number, rows: number, cwd: string, sessionId: string) => {
+    if (!currentRoot) throw new Error('Open a project first.')
+    return startLocalTerminal(profileId, cols, rows, cwd || currentRoot, sessionId)
+  })
+  ipcMain.handle('terminal:input', async (_event, input: string, id?: string) => { (id ? terminalSessions.get(id)?.process : terminal)?.write(input); return true })
+  ipcMain.handle('terminal:resize', async (_event, cols: number, rows: number, id?: string) => { const target = id ? terminalSessions.get(id)?.process : terminal; if (target && cols > 0 && rows > 0) target.resize(cols, rows); return true })
   ipcMain.handle('clipboard:read-text', () => clipboard.readText())
   ipcMain.handle('clipboard:write-text', (_event, value: string) => clipboard.writeText(value))
-  ipcMain.handle('terminal:stop', async () => { terminal?.kill(); terminal = null; terminalKind = null; return true })
-  ipcMain.handle('ssh:start', async (_event, host: string) => {
+  ipcMain.handle('terminal:stop', async (_event, id?: string) => {
+    if (id) { const session = terminalSessions.get(id); terminalSessions.delete(id); session?.process.kill() }
+    else { for (const session of terminalSessions.values()) session.process.kill(); terminalSessions.clear() }
+    if (!id || activeTerminalId === id) {
+      const next = [...terminalSessions.entries()].at(-1)
+      activeTerminalId = next?.[0] || ''
+      terminal = next?.[1].process || null
+      terminalKind = next?.[1].kind || null
+    }
+    return true
+  })
+  ipcMain.handle('ssh:start', async (_event, host: string, cols: number, rows: number, cwd: string, sessionId: string) => {
     if (!/^[\w.@:-]+$/.test(host)) throw new Error('Enter an SSH host such as user@example.com.')
     sendTerminal(`Connecting to ${host}…\r\n`)
-    startPty('ssh', ['-tt', host], currentRoot || app.getPath('home'))
-    terminalKind = 'ssh'
-    return true
+    return startPty('ssh', ['-tt', host], cwd ? ensureWithinRoot(cwd) : currentRoot || app.getPath('home'), cols, rows, sessionId, 'ssh')
   })
-  ipcMain.handle('agent:configure', async (_event, config: { endpoint: string; model: string; apiKey: string }) => {
-    const endpoint = new URL(config.endpoint)
-    if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error('The API endpoint must use HTTP or HTTPS.')
-    if (!config.model.trim() || !config.apiKey.trim()) throw new Error('Enter a model name and API key.')
-    agentConfig = { ...config, endpoint: endpoint.toString().replace(/\/$/, '') }
-    return true
-  })
-  ipcMain.handle('agent:chat', async (_event, messages: Array<{ role: 'user' | 'assistant'; content: string }>, context: string) => {
-    if (!agentConfig) throw new Error('Configure an AI provider first.')
-    const endpoint = /\/chat\/completions$/.test(agentConfig.endpoint) ? agentConfig.endpoint : `${agentConfig.endpoint}/chat/completions`
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${agentConfig.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: agentConfig.model, messages: [{ role: 'system', content: `You are a coding assistant inside Friday. Project root: ${currentRoot || 'none'}. ${context}` }, ...messages] })
-    })
-    const result = await response.json() as { error?: { message?: string }; choices?: Array<{ message?: { content?: string } }> }
-    if (!response.ok) throw new Error(result.error?.message || `Provider returned HTTP ${response.status}.`)
-    return result.choices?.[0]?.message?.content || 'The provider returned an empty answer.'
-  })
-
   createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
 })
@@ -405,3 +459,5 @@ app.on('window-all-closed', () => {
   staticServers.clear()
   if (process.platform !== 'darwin') app.quit()
 })
+
+app.on('before-quit', () => fridayAgent.dispose())
