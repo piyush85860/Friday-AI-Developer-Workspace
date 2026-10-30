@@ -11,6 +11,18 @@ contextBridge.exposeInMainWorld('workspaceAPI', {
     ipcRenderer.on('agent:event', listener)
     return () => ipcRenderer.removeListener('agent:event', listener)
   },
+  multiAgentSnapshot: () => ipcRenderer.invoke('multi-agent:snapshot'),
+  multiAgentProviders: () => ipcRenderer.invoke('multi-agent:providers'),
+  multiAgentConfigure: (id: string, patch: Record<string, unknown>) => ipcRenderer.invoke('multi-agent:configure', id, patch),
+  multiAgentStart: (request: string, dirtyPaths: string[]) => ipcRenderer.invoke('multi-agent:start', request, dirtyPaths),
+  multiAgentCancel: () => ipcRenderer.invoke('multi-agent:cancel'),
+  multiAgentApprove: (taskId: string, approved: boolean) => ipcRenderer.invoke('multi-agent:approve', taskId, approved),
+  multiAgentClear: () => ipcRenderer.invoke('multi-agent:clear'),
+  onMultiAgentEvent: (callback: (event: { id: string; type: string; time: number; taskId?: string; agentId?: string; providerId?: string; detail?: string; data?: unknown }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: { id: string; type: string; time: number; taskId?: string; agentId?: string; providerId?: string; detail?: string; data?: unknown }) => callback(payload)
+    ipcRenderer.on('multi-agent:event', listener)
+    return () => ipcRenderer.removeListener('multi-agent:event', listener)
+  },
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),
@@ -30,7 +42,7 @@ contextBridge.exposeInMainWorld('workspaceAPI', {
   listFiles: () => ipcRenderer.invoke('project:list-files'),
   searchProject: (query: string) => ipcRenderer.invoke('project:search', query),
   readFile: (target: string) => ipcRenderer.invoke('file:read', target),
-  writeFile: (target: string, contents: string) => ipcRenderer.invoke('file:write', target, contents),
+  writeFile: (target: string, contents: string, expectedContents: string) => ipcRenderer.invoke('file:write', target, contents, expectedContents),
   createEntry: (parent: string, name: string, directory: boolean) => ipcRenderer.invoke('file:create', parent, name, directory),
   deleteEntry: (target: string) => ipcRenderer.invoke('file:delete', target),
   cloneRepository: (url: string) => ipcRenderer.invoke('repo:clone', url),

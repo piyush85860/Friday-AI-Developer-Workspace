@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Editor from '@monaco-editor/react'
-import { Activity, Bot, Braces, ChevronDown, ChevronRight, CircleHelp, Clock3, Code2, Command, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, Keyboard, Menu, Minus, MoreHorizontal, PanelBottom, PanelRight, Plus, Search, Settings, SquareTerminal, Trash2, X } from 'lucide-react'
+import { Activity, Bot, Braces, ChevronDown, ChevronRight, CircleHelp, Clock3, Code2, Command, FileCode2, FilePlus2, Files, Folder, FolderOpen, FolderPlus, GitBranch, Keyboard, Menu, Minus, MoreHorizontal, Network, PanelBottom, PanelRight, Plus, Search, Settings, SquareTerminal, Trash2, X } from 'lucide-react'
 import AgentPanel from './AgentPanel'
+import MultiAgentWorkspace from './MultiAgentWorkspace'
 
 type Entry = { name: string; path: string; directory: boolean }
 type Project = { root: string; recent: string[]; tree: Entry[] }
@@ -103,11 +104,12 @@ function TerminalSessionView({ session, active, onReady }: { session: TerminalSe
   return <div className={`terminal-session-view ${active ? 'active' : ''}`}><div className="terminal-body" ref={host} /></div>
 }
 
-function TerminalPanel({ onClose, onNewTerminal, root, sshHost, hidden }: { onClose: () => void; onNewTerminal: () => Promise<string | null>; root: string; sshHost: string | null; hidden: boolean }) {
+function TerminalPanel({ onClose, onNewTerminal, root, sshHost, hidden, authRequest, onAuthHandled }: { onClose: () => void; onNewTerminal: () => Promise<string | null>; root: string; sshHost: string | null; hidden: boolean; authRequest: { id: number; provider: MultiAgentProvider } | null; onAuthHandled: () => void }) {
   const [profiles, setProfiles] = useState<Array<{ id: string; label: string }>>([])
   const [sessions, setSessions] = useState<TerminalSessionInfo[]>([])
   const [activeId, setActiveId] = useState('')
   const terminalRefs = useRef(new Map<string, import('@xterm/xterm').Terminal>())
+  const handledAuthRef = useRef(0)
   const activeSession = sessions.find((session) => session.id === activeId)
   useEffect(() => {
     let cancelled = false
@@ -120,6 +122,15 @@ function TerminalPanel({ onClose, onNewTerminal, root, sshHost, hidden }: { onCl
     }).catch((error: Error) => { if (!cancelled) console.error('Unable to load terminal profiles:', error) })
     return () => { cancelled = true }
   }, [root, sshHost])
+  useEffect(() => {
+    if (!authRequest || !profiles.length || handledAuthRef.current === authRequest.id) return
+    handledAuthRef.current = authRequest.id
+    const session = { id: crypto.randomUUID(), root, profile: profiles[0].id, sshHost: null }
+    setSessions((current) => [...current, session]); setActiveId(session.id)
+    const command = authRequest.provider === 'codex' ? 'codex login' : authRequest.provider === 'claude' ? 'claude auth login' : 'gemini'
+    window.setTimeout(() => { void window.workspaceAPI.terminalInput(`${command}\r`, session.id) }, 1800)
+    onAuthHandled()
+  }, [authRequest, profiles, root, sshHost, onAuthHandled])
   const addSession = (cwd: string) => {
     const session = { id: crypto.randomUUID(), root: cwd, profile: profiles[0]?.id || '', sshHost: null }
     setSessions((current) => [...current, session])
@@ -159,8 +170,9 @@ export default function App() {
   const [recent, setRecent] = useState<string[]>([])
   const [tabs, setTabs] = useState<OpenTab[]>([])
   const [activePath, setActivePath] = useState('')
-  const [activeView, setActiveView] = useState<'files' | 'search' | 'source' | 'agent'>('files')
+  const [activeView, setActiveView] = useState<'files' | 'search' | 'source' | 'agent' | 'multiAgent'>('files')
   const [showTerminal, setShowTerminal] = useState(true)
+  const [authRequest, setAuthRequest] = useState<{ id: number; provider: MultiAgentProvider } | null>(null)
   const [showTerminalProjectPicker, setShowTerminalProjectPicker] = useState(false)
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
@@ -195,6 +207,8 @@ export default function App() {
   const keyChordTimerRef = useRef<number | null>(null)
   const workspaceKeyRootRef = useRef('')
   const terminalRootResolverRef = useRef<((root: string | null) => void) | null>(null)
+  const requestProviderAuth = (provider: MultiAgentProvider) => { setAuthRequest({ id: Date.now(), provider }); setActiveView('files'); setShowSidebar(true); setShowTerminal(true) }
+  const authHandled = useCallback(() => setAuthRequest(null), [])
   const activeTab = tabs.find((tab) => tab.path === activePath)
   const topWorkspaceFolders = workspaceFolders.filter((folder) => folder.parentPath === null)
   const selectedDirectory = selectedParentPath && selectedParentPath !== '__workspace__' ? selectedParentPath : project?.root || ''
@@ -397,7 +411,7 @@ export default function App() {
   const saveActive = async () => {
     if (!activeTab || !isDirty(activeTab)) return true
     try {
-      await window.workspaceAPI.writeFile(activeTab.path, activeTab.contents)
+      await window.workspaceAPI.writeFile(activeTab.path, activeTab.contents, activeTab.savedContents)
       setTabs((current) => current.map((tab) => tab.path === activeTab.path ? { ...tab, savedContents: tab.contents } : tab))
       say('Saved')
       return true
@@ -524,6 +538,7 @@ export default function App() {
         <button className={activeView === 'search' ? 'active' : ''} title="Search" onClick={() => { setActiveView('search'); setShowSidebar(true) }}><Search size={21} /></button>
         <button className={activeView === 'source' ? 'active' : ''} title="Source control" onClick={() => { setActiveView('source'); setShowSidebar(true) }}><GitBranch size={21} /></button>
         <button className={activeView === 'agent' ? 'active' : ''} title="Agent" aria-label="Agent" onClick={() => { setActiveView(activeView === 'agent' ? 'files' : 'agent'); setShowSidebar(true) }}><Bot size={21} /></button>
+        <button className={activeView === 'multiAgent' ? 'active' : ''} title="Multi-Agent" aria-label="Multi-Agent" onClick={() => { setActiveView(activeView === 'multiAgent' ? 'files' : 'multiAgent'); setShowSidebar(activeView !== 'multiAgent') }}><Network size={20} /></button>
         <div className="activity-spacer" /><button title="Extensions" onClick={() => { void window.workspaceAPI.openExternal('https://marketplace.visualstudio.com/VSCode'); say('Opened the VS Code extension marketplace in your browser.') }}><Braces size={20} /></button><button title="Settings" onClick={() => setShowSettings(true)}><Settings size={20} /></button>
       </nav>
       <aside className="sidebar">
@@ -534,13 +549,14 @@ export default function App() {
           <div className="sidebar-bottom"><button onClick={() => activeTab ? say('Outline is based on symbols in the open file; Monaco symbol navigation is available with Ctrl+Shift+O.') : say('Open a file to see its outline.')}><ChevronRight size={13} /> OUTLINE</button><button onClick={() => activeTab ? say(`Timeline for ${activeTab.name}: view Git history with git log --follow -- ${activeTab.name}`) : say('Open a file to see its timeline.')}><ChevronRight size={13} /> TIMELINE</button></div>
         </> : activeView === 'search' ? <div className="search-sidebar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search in files" autoFocus /><div className="search-results">{searchResults.map((result, index) => <button key={`${result.path}-${result.line}-${index}`} onClick={() => void openFile({ name: result.name, path: result.path, directory: false }, result.line)}><span>{result.name}{result.line ? `:${result.line}` : ''}</span><small>{result.preview || result.path.replace(project.root, '')}</small></button>)}{query && searchResults.length === 0 && <p>No matching files or text.</p>}</div></div> : <div className="search-sidebar source-control"><p>SOURCE CONTROL</p><pre>{gitStatus || 'Working tree clean'}</pre><button className="secondary-button" onClick={() => void stageChanges()}>Stage All Changes</button><input value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="Commit message" /><button className="primary-button" disabled={!commitMessage.trim()} onClick={() => void commitChanges()}>Commit</button></div>}
       </aside>
-      <section className={`editor-column ${activeView === 'agent' ? 'agent-open' : ''}`}>
+      <section className={`editor-column ${activeView === 'agent' ? 'agent-open' : ''} ${activeView === 'multiAgent' ? 'multi-agent-open' : ''}`}>
         <div className={`agent-main-view ${activeView === 'agent' ? '' : 'hidden'}`}><AgentPanel key={project.root} root={project.root} buffers={tabs.map((tab) => ({ path: tab.path, content: tab.contents, dirty: isDirty(tab) }))} onOpenFile={(path) => void openAgentFile(path)} onRefresh={() => void refreshProject()} /></div>
-        <div className="editor-main-view">
+        <div className={`multi-agent-full-view ${activeView === 'multiAgent' ? '' : 'hidden'}`}><MultiAgentWorkspace root={project.root} dirtyPaths={tabs.filter(isDirty).map((tab) => tab.path)} onAuth={requestProviderAuth} onOpenFile={(target) => void openAgentFile(target)} onRefresh={() => void refreshProject()} /></div>
+        <div className={`editor-main-view ${activeView === 'multiAgent' ? 'hidden' : ''}`}>
         <div className="tabs-row">{tabs.map((tab) => <button key={tab.path} onClick={() => setActivePath(tab.path)} className={`editor-tab ${activePath === tab.path ? 'selected' : ''}`}>{fileIcon(tab.name)}<span>{tab.name}</span>{isDirty(tab) ? <span className="dirty-dot" /> : null}<span className="tab-close" onClick={(event) => { event.stopPropagation(); closeTab(tab.path) }}><X size={13} /></span></button>)}<div className="tab-actions"><button title="Toggle word wrap" onClick={() => setWordWrap((value) => !value)}><PanelRight size={15} /></button><button title="Command palette" onClick={() => { setShowCommand(true); setTimeout(() => commandRef.current?.focus(), 20) }}><MoreHorizontal size={16} /></button></div></div>
         {activeTab ? <><div className="breadcrumbs">{activeTab.path.replace(project.root, project.root.split(/[\\/]/).filter(Boolean).at(-1) || '').split(/[\\/]/).map((part, index, array) => <span key={`${part}-${index}`}>{part}{index < array.length - 1 ? <ChevronRight size={12} /> : null}</span>)}</div>
           <div className="code-editor"><Editor height="100%" theme="vs-dark" path={activeTab.path} language={languages[activeTab.name.split('.').pop()?.toLowerCase() || ''] || 'plaintext'} value={activeTab.contents} onChange={changeContents} loading={<div className="editor-loading">Loading editor…</div>} onMount={(editor, monaco) => { editorRef.current = editor; editor.addAction({ id: 'friday.run-active-file', label: 'Run Active File', keybindings: [monaco.KeyMod.Shift | monaco.KeyCode.Enter], run: () => runActiveRef.current() }); if (pendingLine) { editor.setPosition({ lineNumber: pendingLine, column: 1 }); editor.revealLineInCenter(pendingLine); setPendingLine(undefined) } }} options={{ readOnly: busy, fontSize: editorFontSize, fontFamily: 'Cascadia Code, Consolas, monospace', minimap: { enabled: false }, scrollBeyondLastLine: false, automaticLayout: true, wordWrap: wordWrap ? 'on' : 'off', padding: { top: 14 }, renderLineHighlight: 'line', lineNumbersMinChars: 3, tabSize: 2 }} /></div></> : <div className="editor-empty"><div className="empty-logo"><Code2 size={44} /></div><div className="shortcut-list"><div><button onClick={() => setShowTerminal(true)}>Show Terminal</button><kbd>Ctrl</kbd><span>+</span><kbd>J</kbd></div><div><button onClick={() => { setActiveView('search'); document.querySelector<HTMLInputElement>('.search-sidebar input')?.focus() }}>Search Files</button><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>F</kbd></div></div></div>}
-        <TerminalPanel key={`${project.root}:${terminalPanelVersion}:${sshHost || 'local'}`} root={topWorkspaceFolders[0]?.path || project.root} sshHost={sshHost} onNewTerminal={requestNewTerminal} onClose={() => setShowTerminal(false)} hidden={!showTerminal} />
+        <TerminalPanel key={`${project.root}:${terminalPanelVersion}:${sshHost || 'local'}`} root={topWorkspaceFolders[0]?.path || project.root} sshHost={sshHost} onNewTerminal={requestNewTerminal} onClose={() => setShowTerminal(false)} hidden={!showTerminal || activeView === 'multiAgent'} authRequest={authRequest} onAuthHandled={authHandled} />
         </div>
       </section>
     </div>

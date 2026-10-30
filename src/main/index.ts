@@ -7,9 +7,12 @@ import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/pro
 import path from 'node:path'
 import * as pty from 'node-pty'
 import { FridayAgent } from './agent'
+import { MultiAgentController } from './multiAgent/controller'
+import type { AgentRole, ProviderId } from './multiAgent/types'
 
 let mainWindow: BrowserWindow | null = null
 const fridayAgent = new FridayAgent(() => mainWindow)
+let multiAgent: MultiAgentController | null = null
 let terminal: pty.IPty | null = null
 let activeTerminalId = ''
 const terminalSessions = new Map<string, { process: pty.IPty; kind: 'local' | 'ssh'; cwd: string }>()
@@ -59,6 +62,7 @@ async function addRecent(projectPath: string) {
   currentRoot = projectPath
   workspaceRoots = [projectPath]
   fridayAgent.setRoot(projectPath)
+  multiAgent?.setRoot(projectPath)
   return recent
 }
 
@@ -258,6 +262,33 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  multiAgent = new MultiAgentController(() => mainWindow, path.join(app.getPath('userData'), 'multi-agent-v1.json'))
+  void multiAgent.initialize()
+  const assertFridaySender = (sender: Electron.WebContents) => { if (sender !== mainWindow?.webContents) throw new Error('Multi-Agent requests are only accepted from Friday.') }
+  ipcMain.handle('multi-agent:snapshot', async (event) => { assertFridaySender(event.sender); await multiAgent?.initialize(); return multiAgent?.snapshot() })
+  ipcMain.handle('multi-agent:providers', async (event) => { assertFridaySender(event.sender); return Promise.all((['codex', 'claude', 'gemini'] as ProviderId[]).map((id) => multiAgent!.providerStatus(id))) })
+  ipcMain.handle('multi-agent:configure', (event, id: unknown, patch: unknown) => {
+    assertFridaySender(event.sender)
+    if (!multiAgent || !['orchestrator', 'codebase', 'coding', 'research', 'review'].includes(String(id))) throw new Error('Unknown Multi-Agent role.')
+    if (!patch || typeof patch !== 'object') throw new Error('Invalid agent configuration.')
+    const value = patch as Record<string, unknown>
+    if (value.providerId !== undefined && !['codex', 'claude', 'gemini'].includes(String(value.providerId))) throw new Error('Unsupported provider.')
+    if (value.model !== undefined && typeof value.model !== 'string') throw new Error('Model must be text.')
+    if (value.instructions !== undefined && typeof value.instructions !== 'string') throw new Error('Instructions must be text.')
+    if (value.timeoutMs !== undefined && typeof value.timeoutMs !== 'number') throw new Error('Timeout must be numeric.')
+    if (value.filesystemPermission !== undefined && !['read-only', 'workspace-write'].includes(String(value.filesystemPermission))) throw new Error('Unsupported filesystem permission profile.')
+    return multiAgent.updateAgent(id as AgentRole, value as { providerId?: ProviderId; model?: string; instructions?: string; timeoutMs?: number; filesystemPermission?: 'read-only' | 'workspace-write' })
+  })
+  ipcMain.handle('multi-agent:start', async (event, request: unknown, dirtyPaths: unknown) => {
+    assertFridaySender(event.sender)
+    if (typeof request !== 'string' || request.length > 12_000) throw new Error('Multi-Agent request must be text under 12,000 characters.')
+    const dirty = Array.isArray(dirtyPaths) ? dirtyPaths : []
+    if (dirty.length > 100 || dirty.some((entry) => typeof entry !== 'string' || entry.length > 2_000)) throw new Error('Invalid dirty buffer list.')
+    return multiAgent?.start(request, dirty as string[])
+  })
+  ipcMain.handle('multi-agent:cancel', (event) => { assertFridaySender(event.sender); return multiAgent?.cancel() || false })
+  ipcMain.handle('multi-agent:approve', (event, taskId: unknown, approved: unknown) => { assertFridaySender(event.sender); return typeof taskId === 'string' && typeof approved === 'boolean' ? multiAgent?.approveTask(taskId, approved) || false : false })
+  ipcMain.handle('multi-agent:clear', async (event) => { assertFridaySender(event.sender); return multiAgent?.clearHistory() })
   ipcMain.handle('agent:status', (event) => { if (event.sender !== mainWindow?.webContents) throw new Error('Agent status is only available to Friday.'); return fridayAgent.status() })
   ipcMain.handle('agent:test-connection', (event) => { if (event.sender !== mainWindow?.webContents) throw new Error('Connection checks are only accepted from Friday.'); return fridayAgent.testConnection() })
   ipcMain.handle('agent:send', async (event, request: unknown, options: unknown) => {
@@ -332,6 +363,7 @@ app.whenReady().then(() => {
     workspaceRoots = canonical
     currentRoot = canonical[0] || ''
     fridayAgent.setRoot(currentRoot)
+    multiAgent?.setRoot(currentRoot)
     return true
   })
   ipcMain.handle('project:list-directory', async (_event, folder: string) => treeFor(currentRoot, await existingWithinRoot(folder)))
@@ -379,8 +411,11 @@ app.whenReady().then(() => {
     return matches
   })
   ipcMain.handle('file:read', async (_event, target: string) => readFile(await existingWithinRoot(target), 'utf8'))
-  ipcMain.handle('file:write', async (_event, target: string, contents: string) => {
+  ipcMain.handle('file:write', async (_event, target: string, contents: string, expectedContents?: unknown) => {
     const resolved = await existingWithinRoot(target)
+    if (typeof expectedContents !== 'string') throw new Error('Cannot save without the editor’s last saved contents.')
+    const diskContents = await readFile(resolved, 'utf8')
+    if (diskContents !== expectedContents) throw new Error('This file changed on disk after it was opened. Your editor contents are preserved; compare the file before saving again.')
     await mkdir(path.dirname(resolved), { recursive: true })
     await writeFile(resolved, contents, 'utf8')
     return true
@@ -460,4 +495,4 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => fridayAgent.dispose())
+app.on('before-quit', () => { fridayAgent.dispose(); multiAgent?.dispose() })
